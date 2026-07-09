@@ -27,7 +27,11 @@ grain_top_y = 10
 grain_row_step = 1.5
 grain_grid = {}
 
-rotation_duration = 45  -- 1.5s flip (phase 3)
+rotation_duration = 20  -- 0.67s flip (phase 3); tune by eye alongside the
+                        -- topple_pass_rotated iteration count in _update --
+                        -- a faster sweep needs more iterations/frame to
+                        -- keep the pile visually caught up, not just a
+                        -- shorter timer
 
 max_h = {}
 heights_top = {}
@@ -35,10 +39,12 @@ heights_bottom = {}
 frame_count = 0
 scan_lr = true
 grain_timer = 0
-debug_mode = true  -- set true to show the mass/grain debug overlay
+debug_mode = false  -- set true to show the mass/grain debug overlay
 top_fill_ratio = 0.85  -- put near the other tunables at the top of the file
 peak_top_smooth = 0
 peak_bottom_smooth = 0
+is_rotating = false
+rotation_timer = 0
 function _init()
  for x=1,grid_w do
   heights_top[x] = {}
@@ -93,26 +99,32 @@ function draw_thick_line(ax,ay,bx,by,col)
  line(ax+1,ay,bx+1,by,col)
 end
 
-function draw_ring(pts,col)
+function draw_ring(pts,col,theta)
+ theta = theta or 0
  for i=1,#pts do
   local a = pts[i]
   local b = pts[i%#pts+1]
-  local ax,ay = iso_project(a[1],a[2],a[3])
-  local bx,by = iso_project(b[1],b[2],b[3])
-  line(ax,ay,bx,by,col)
+  local ay,az = rotate_x(a[2],a[3],theta)
+  local by,bz = rotate_x(b[2],b[3],theta)
+  local ax,ay2 = iso_project(a[1],ay,az)
+  local bx,by2 = iso_project(b[1],by,bz)
+  line(ax,ay2,bx,by2,col)
  end
 end
 
-function draw_ring_depth(pts,col_front,col_back,pass)
+function draw_ring_depth(pts,col_front,col_back,pass,theta)
+ theta = theta or 0
  for i=1,#pts do
   local a = pts[i]
   local b = pts[i%#pts+1]
-  local is_front = (a[1]+a[3]+b[1]+b[3])/2 > 0
+  local ay,az = rotate_x(a[2],a[3],theta)
+  local by,bz = rotate_x(b[2],b[3],theta)
+  local is_front = (a[1]+az+b[1]+bz)/2 > 0
   if (pass=="front" and is_front) or (pass=="back" and not is_front) then
-   local ax,ay = iso_project(a[1],a[2],a[3])
-   local bx,by = iso_project(b[1],b[2],b[3])
+   local ax,ay2 = iso_project(a[1],ay,az)
+   local bx,by2 = iso_project(b[1],by,bz)
    local c = is_front and col_front or col_back
-   draw_thick_line(ax,ay,bx,by,c)
+   draw_thick_line(ax,ay2,bx,by2,c)
   end
  end
 end
@@ -127,37 +139,49 @@ function draw_struts(pts_a,pts_b,col)
  end
 end
 
-function draw_struts_depth(pts_a,pts_b,col_front,col_back,pass)
+function draw_struts_depth(pts_a,pts_b,col_front,col_back,pass,theta)
+ theta = theta or 0
  for i=1,#pts_a do
   local a = pts_a[i]
   local b = pts_b[i]
-  local is_front = false
-  for _,fi in pairs(front_struts) do
-   if fi==i then is_front=true end
+  local is_front
+  if theta==0 then
+   is_front = false
+   for _,fi in pairs(front_struts) do
+    if fi==i then is_front=true end
+   end
+  else
+   local _,az = rotate_x(a[2],a[3],theta)
+   local _,bz = rotate_x(b[2],b[3],theta)
+   is_front = (a[1]+az+b[1]+bz)/2 > 0
   end
   if (pass=="front" and is_front) or (pass=="back" and not is_front) then
-   local ax,ay = iso_project(a[1],a[2],a[3])
-   local bx,by = iso_project(b[1],b[2],b[3])
+   local ay,az = rotate_x(a[2],a[3],theta)
+   local by,bz = rotate_x(b[2],b[3],theta)
+   local ax,ay2 = iso_project(a[1],ay,az)
+   local bx,by2 = iso_project(b[1],by,bz)
    local c = is_front and col_front or col_back
-   draw_thick_line(ax,ay,bx,by,c)
+   draw_thick_line(ax,ay2,bx,by2,c)
   end
  end
 end
 
 
-function draw_hourglass_back()
- draw_ring_depth(top_rim,7,5,"back")
- draw_struts_depth(top_rim,neck,7,5,"back")
- draw_ring(neck,7)
- draw_struts_depth(neck,bot_rim,7,5,"back")
- draw_ring_depth(bot_rim,7,5,"back")
+function draw_hourglass_back(theta)
+ theta = theta or 0
+ draw_ring_depth(top_rim,7,5,"back",theta)
+ draw_struts_depth(top_rim,neck,7,5,"back",theta)
+ draw_ring(neck,7,theta)
+ draw_struts_depth(neck,bot_rim,7,5,"back",theta)
+ draw_ring_depth(bot_rim,7,5,"back",theta)
 end
 
-function draw_hourglass_front()
- draw_ring_depth(top_rim,7,5,"front")
- draw_struts_depth(top_rim,neck,7,5,"front")
- draw_struts_depth(neck,bot_rim,7,5,"front")
- draw_ring_depth(bot_rim,7,5,"front")
+function draw_hourglass_front(theta)
+ theta = theta or 0
+ draw_ring_depth(top_rim,7,5,"front",theta)
+ draw_struts_depth(top_rim,neck,7,5,"front",theta)
+ draw_struts_depth(neck,bot_rim,7,5,"front",theta)
+ draw_ring_depth(bot_rim,7,5,"front",theta)
 end
 
 -- maps a heightmap grid cell to local x,z footprint coords,
@@ -205,18 +229,22 @@ end
 -- base_y is the local-y datum the column is anchored to.
 -- dir=1 grows the column upward from base_y (resting on a floor);
 -- dir=-1 grows it downward from base_y (hanging from the rim)
-function draw_iso_column(lx,lz,base_y,height,col,dir)
+function draw_iso_column(lx,lz,base_y,height,col,dir,theta)
  if height<=0 then return end
  dir = dir or 1
- local sx,sy_a = iso_project(lx,base_y,lz)
- local _,sy_b = iso_project(lx,base_y+height*dir,lz)
- line(sx,sy_a,sx,sy_b,col)
- line(sx+1,sy_a,sx+1,sy_b,col)
+ theta = theta or 0
+ local ay,az = rotate_x(base_y,lz,theta)
+ local by,bz = rotate_x(base_y+height*dir,lz,theta)
+ local ax,ay2 = iso_project(lx,ay,az)
+ local bx,by2 = iso_project(lx,by,bz)
+ line(ax,ay2,bx,by2,col)
+ line(ax+1,ay2,bx+1,by2,col)
 end
 
 -- draws every column of a heightmap back-to-front (far first, near last)
 -- so nearer/taller columns correctly occlude those behind.
-function draw_heightmap(heights,base_y,dir)
+function draw_heightmap(heights,base_y,dir,theta)
+ theta = theta or 0
  local peak = 0
  for x=1,grid_w do
   for y=1,grid_h do
@@ -227,7 +255,13 @@ function draw_heightmap(heights,base_y,dir)
   peak_bottom_smooth = peak
  end
  if peak_bottom_smooth<=0 then return end
- for s=0,grid_w+grid_h-2 do
+ local s_start,s_end,s_step
+ if cos(theta)>=0 then
+  s_start,s_end,s_step = 0,grid_w+grid_h-2,1
+ else
+  s_start,s_end,s_step = grid_w+grid_h-2,0,-1
+ end
+ for s=s_start,s_end,s_step do
   for gx=1,grid_w do
    local gy = s-gx+2
    if gy>=1 and gy<=grid_h then
@@ -236,7 +270,7 @@ function draw_heightmap(heights,base_y,dir)
      local lx,lz = grid_to_local(gx,gy,rim_r)
      local ratio = h/peak_bottom_smooth
      local c = ratio>0.66 and 9 or (ratio>0.33 and 15 or 4)
-     draw_iso_column(lx,lz,base_y,h,c,dir)
+     draw_iso_column(lx,lz,base_y,h,c,dir,theta)
     end
    end
   end
@@ -295,6 +329,50 @@ function topple_pass(heights,grav_x,grav_y)
         heights[x][y] -= 1
         heights[nx][ny] += 1
         h -= 1
+       end
+      end
+     end
+    end
+   end
+   ::continue::
+  end
+ end
+end
+
+-- like topple_pass, but "downhill" is judged by each column's projected
+-- world-space height under the live rotation angle theta, instead of raw
+-- heights[x][y]. reuses rotate_x directly: the world-height of a column
+-- resting on the fixed bottom floor (bot_rim_y) with fill h is just the
+-- rotated y-component of the point (bot_rim_y+h, lz). max_h containment
+-- is untouched -- it's valid at any theta since the whole assembly
+-- (glass + sand) rotates rigidly together.
+function topple_pass_rotated(heights,theta)
+ -- theta is constant for the whole call (and across every iteration
+ -- this frame), so cos/sin only need computing once here, not inside
+ -- the neighbor loop. only the rotated y (world-height) is ever used,
+ -- so this skips rotate_x's unused z' computation too -- rotate_x(y,z,t)
+ -- would otherwise get called up to 8x per cell per pass, most of it
+ -- redundant trig work pico-8's per-frame budget can't absorb.
+ local ct,st = cos(theta),sin(theta)
+ for x=1,grid_w do
+  for y=1,grid_h do
+   if max_h[x][y]==0 then goto continue end
+   local h = heights[x][y]
+   local lx,lz = grid_to_local(x,y,rim_r)
+   local wh = (bot_rim_y+h)*ct - lz*st
+   for dx=-1,1 do
+    for dy=-1,1 do
+     if not (dx==0 and dy==0) and h>0 then
+      local nx,ny = x+dx,y+dy
+      if nx>=1 and nx<=grid_w and ny>=1 and ny<=grid_h then
+       local nh = heights[nx][ny]
+       local _,nlz = grid_to_local(nx,ny,rim_r)
+       local nwh = (bot_rim_y+nh)*ct - nlz*st
+       if nwh<wh-repose_threshold and nh+1<=max_h[nx][ny] then
+        heights[x][y] -= 1
+        heights[nx][ny] += 1
+        h -= 1
+        wh = (bot_rim_y+h)*ct - lz*st
        end
       end
      end
@@ -504,10 +582,42 @@ function flush_grains_to_heightmap()
     if max_h[hx][hy]>0 and heights_bottom[hx][hy]<max_h[hx][hy] then
      grain_grid[r][c] = false
      heights_bottom[hx][hy] += 1
+    else
+     -- mapped cell is already at capacity (common near the neck at the
+     -- tail end of a drain) -- fall back to any cell with room so this
+     -- always actually clears the grain. leaving it stuck here would
+     -- freeze it in grain_grid for the whole rotation, rendered at a
+     -- fixed unrotated screen position by draw_grain_grid while the
+     -- glass rotates around it -- exactly the "sand falling out" bug.
+     for x=1,grid_w do
+      for y=1,grid_h do
+       if max_h[x][y]>0 and heights_bottom[x][y]<max_h[x][y] then
+        grain_grid[r][c] = false
+        heights_bottom[x][y] += 1
+        goto placed
+       end
+      end
+     end
+     ::placed::
     end
    end
   end
  end
+end
+
+-- true once heights_top is fully empty. any grains still mid-flight are
+-- resolved instantly via flush_grains_to_heightmap() at the moment the
+-- flip triggers (see _update), rather than waiting several more frames
+-- for the last grain to finish its animated fall -- that wait was an
+-- awkward, barely-visible pause between the top bulb looking empty and
+-- the flip actually starting
+function is_drained()
+ for x=1,grid_w do
+  for y=1,grid_h do
+   if heights_top[x][y]>0 then return false end
+  end
+ end
+ return true
 end
 
 function draw_grain_grid()
@@ -545,23 +655,50 @@ end
 
 function _update()
  frame_count += 1
- topple_pass(heights_top,0,1)
- for i=1,4 do
-  topple_pass(heights_bottom,0,9)
- end
- spawn_grain()
- for i=1,1 do
-  update_grain_grid(0,9)
+ if is_rotating then
+  rotation_timer += 1
+  local theta = (rotation_timer/rotation_duration)*0.5
+  for i=1,6 do
+   topple_pass_rotated(heights_bottom,theta)
+  end
+  if rotation_timer>=rotation_duration then
+   heights_top, heights_bottom = heights_bottom, heights_top
+   local new_peak = 0
+   for x=1,grid_w do
+    for y=1,grid_h do
+     if heights_top[x][y]>new_peak then new_peak=heights_top[x][y] end
+    end
+   end
+   peak_top_smooth = new_peak
+   peak_bottom_smooth = 0
+   is_rotating = false
+   rotation_timer = 0
+  end
+ else
+  topple_pass(heights_top,0,1)
+  for i=1,4 do
+   topple_pass(heights_bottom,0,9)
+  end
+  spawn_grain()
+  for i=1,1 do
+   update_grain_grid(0,9)
+  end
+  if is_drained() or (debug_mode and btnp(5)) then
+   flush_grains_to_heightmap()
+   is_rotating = true
+   rotation_timer = 0
+  end
  end
 end
 
 function _draw()
  cls(0)
- draw_hourglass_back()
- draw_heightmap(heights_bottom,bot_rim_y,1)
+ local theta = is_rotating and (rotation_timer/rotation_duration)*0.5 or 0
+ draw_hourglass_back(theta)
+ draw_heightmap(heights_bottom,bot_rim_y,1,theta)
  draw_heightmap_top(heights_top)
  draw_grain_grid()
- draw_hourglass_front()
+ draw_hourglass_front(theta)
 
  if debug_mode then
   draw_debug_overlay()
@@ -592,6 +729,7 @@ function draw_debug_overlay()
   if stuck_r>-1 then break end
  end
  print("grain@ r"..stuck_r.." c"..stuck_c,2,14,7)
+ print("rot:"..(is_rotating and "true" or "false").." t:"..rotation_timer,2,20,7)
 end
 
 __gfx__
