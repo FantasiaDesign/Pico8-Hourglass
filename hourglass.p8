@@ -8,48 +8,54 @@ rim_r = 18
 neck_r = 3
 top_rim_y = 26
 bot_rim_y = -26
-bulb_inner_r = 14  -- actual radius sand is allowed to occupy, in local-space units
-bulb_max_h = 26   -- vertical span from rim to neck; used for tapered containment
+front_struts = {6,7,8,1}  
 
-duration_frames = 90      -- 10s @ 30fps
+duration_frames = 300      -- 10s drain (use 90 for testing)
 repose_threshold = 1       -- tune by eye; higher = steeper cone
 
--- grain-stream automaton: a small local vertical band around the neck
--- (the neck ring itself is a single point at y=0; this band is a
--- physics/render-only construct for the falling grain stream)
-neck_cols = 3
-neck_rows = 12
-neck_top_y = 10
-neck_row_step = 1.5
-neck_gx = 9  -- fixed grid cell the grain stream draws from / drains into
+neck_gx = 9  -- heightmap cell the grain grid's center column maps to
 neck_gy = 9
 
+-- unified grain grid: narrow at the top (the neck tube), widens toward
+-- the bottom (the landing zone over the bottom pile). replaces the old
+-- fixed 3-wide neck_grid so every grain is visible for its whole journey
+grain_rows = 15
+grain_narrow_cols = 5
+grain_wide_cols = 9
+grain_neck_rows = 8
+grain_top_y = 10
+grain_row_step = 1.5
+grain_grid = {}
+
+rotation_duration = 45  -- 1.5s flip (phase 3)
+
+max_h = {}
 heights_top = {}
 heights_bottom = {}
-neck_grid = {}
 frame_count = 0
 scan_lr = true
 grain_timer = 0
-
+debug_mode = true  -- set true to show the mass/grain debug overlay
+top_fill_ratio = 0.85  -- put near the other tunables at the top of the file
+peak_top_smooth = 0
+peak_bottom_smooth = 0
 function _init()
  for x=1,grid_w do
   heights_top[x] = {}
   heights_bottom[x] = {}
-  for y=1,grid_h do
-   heights_top[x][y] = 7
-   heights_bottom[x][y] = 0
-  end
  end
- for c=1,neck_cols do
-  neck_grid[c] = {}
-  for r=1,neck_rows do
-   neck_grid[c][r] = false
+ init_grain_grid()
+ init_max_heights()
+ for x=1,grid_w do
+  for y=1,grid_h do
+   heights_top[x][y] = flr(max_h[x][y] * top_fill_ratio)
+   heights_bottom[x][y] = 0
   end
  end
  grains_total = 0
  for x=1,grid_w do
   for y=1,grid_h do
-   if is_in_bulb(x,y) then
+   if max_h[x][y] > 0 then
     grains_total += heights_top[x][y]
    end
   end
@@ -82,6 +88,11 @@ top_rim = ring(rim_r,top_rim_y)
 neck = ring(neck_r,0)
 bot_rim = ring(rim_r,bot_rim_y)
 
+function draw_thick_line(ax,ay,bx,by,col)
+ line(ax,ay,bx,by,col)
+ line(ax+1,ay,bx+1,by,col)
+end
+
 function draw_ring(pts,col)
  for i=1,#pts do
   local a = pts[i]
@@ -89,6 +100,20 @@ function draw_ring(pts,col)
   local ax,ay = iso_project(a[1],a[2],a[3])
   local bx,by = iso_project(b[1],b[2],b[3])
   line(ax,ay,bx,by,col)
+ end
+end
+
+function draw_ring_depth(pts,col_front,col_back,pass)
+ for i=1,#pts do
+  local a = pts[i]
+  local b = pts[i%#pts+1]
+  local is_front = (a[1]+a[3]+b[1]+b[3])/2 > 0
+  if (pass=="front" and is_front) or (pass=="back" and not is_front) then
+   local ax,ay = iso_project(a[1],a[2],a[3])
+   local bx,by = iso_project(b[1],b[2],b[3])
+   local c = is_front and col_front or col_back
+   draw_thick_line(ax,ay,bx,by,c)
+  end
  end
 end
 
@@ -102,12 +127,37 @@ function draw_struts(pts_a,pts_b,col)
  end
 end
 
-function draw_hourglass()
- draw_ring(top_rim,7)
- draw_struts(top_rim,neck,7)
+function draw_struts_depth(pts_a,pts_b,col_front,col_back,pass)
+ for i=1,#pts_a do
+  local a = pts_a[i]
+  local b = pts_b[i]
+  local is_front = false
+  for _,fi in pairs(front_struts) do
+   if fi==i then is_front=true end
+  end
+  if (pass=="front" and is_front) or (pass=="back" and not is_front) then
+   local ax,ay = iso_project(a[1],a[2],a[3])
+   local bx,by = iso_project(b[1],b[2],b[3])
+   local c = is_front and col_front or col_back
+   draw_thick_line(ax,ay,bx,by,c)
+  end
+ end
+end
+
+
+function draw_hourglass_back()
+ draw_ring_depth(top_rim,7,5,"back")
+ draw_struts_depth(top_rim,neck,7,5,"back")
  draw_ring(neck,7)
- draw_struts(neck,bot_rim,7)
- draw_ring(bot_rim,7)
+ draw_struts_depth(neck,bot_rim,7,5,"back")
+ draw_ring_depth(bot_rim,7,5,"back")
+end
+
+function draw_hourglass_front()
+ draw_ring_depth(top_rim,7,5,"front")
+ draw_struts_depth(top_rim,neck,7,5,"front")
+ draw_struts_depth(neck,bot_rim,7,5,"front")
+ draw_ring_depth(bot_rim,7,5,"front")
 end
 
 -- maps a heightmap grid cell to local x,z footprint coords,
@@ -119,15 +169,39 @@ function grid_to_local(gx,gy,footprint_r)
  return (gx-cx)*scale,(gy-cy)*scale
 end
 
--- true if grid cell (gx,gy) falls within the bulb's sand-bearing radius.
--- defined purely in local space so it works identically for rendering,
--- toppling, and mid-rotation physics
-function is_in_bulb(gx,gy)
- local lx,lz = grid_to_local(gx,gy,bulb_inner_r)
- return (lx*lx+lz*lz) <= bulb_inner_r*bulb_inner_r
+-- radius of a regular 8-gon's edge at a given angle (turns), for
+-- vertices placed at i/8+1/16 (matches ring()). used so the sand
+-- boundary matches the drawn octagon, not its circumscribed circle.
+function octagon_radius(theta, r)
+ local seg = 1/8
+ local half = 1/16
+ local d = theta % seg
+ if d > half then d -= seg end
+ return r*cos(half)/cos(d)
 end
 
--- draws one column of sand as a vertical pixel stack.
+function init_max_heights()
+ for gx=1,grid_w do
+  max_h[gx] = {}
+  for gy=1,grid_h do
+   local lx, lz = grid_to_local(gx, gy, rim_r)
+   local dist = sqrt(lx*lx + lz*lz)
+   local theta = atan2(lx, lz) 
+			local outer_r = octagon_radius(theta, rim_r) 
+			local inner_r = octagon_radius(theta, neck_r)
+   if dist >= outer_r then
+    max_h[gx][gy] = 0
+   elseif dist <= inner_r then
+    max_h[gx][gy] = abs(bot_rim_y)
+   else
+    max_h[gx][gy] = flr(abs(bot_rim_y) * (outer_r - dist) / (outer_r - inner_r))
+   end
+  end
+ end
+end
+
+-- draws one column of sand as a vertical pixel stack, 2px wide so
+-- adjacent columns don't leave sub-pixel gaps between them.
 -- base_y is the local-y datum the column is anchored to.
 -- dir=1 grows the column upward from base_y (resting on a floor);
 -- dir=-1 grows it downward from base_y (hanging from the rim)
@@ -137,49 +211,79 @@ function draw_iso_column(lx,lz,base_y,height,col,dir)
  local sx,sy_a = iso_project(lx,base_y,lz)
  local _,sy_b = iso_project(lx,base_y+height*dir,lz)
  line(sx,sy_a,sx,sy_b,col)
+ line(sx+1,sy_a,sx+1,sy_b,col)
 end
 
 -- draws every column of a heightmap back-to-front (far first, near last)
 -- so nearer/taller columns correctly occlude those behind.
--- columns outside the tapered footprint are skipped so sand never
--- pokes past the glass silhouette at any height level
-function draw_heightmap(heights,base_y,col,dir,max_height)
+function draw_heightmap(heights,base_y,dir)
+ local peak = 0
+ for x=1,grid_w do
+  for y=1,grid_h do
+   if heights[x][y]>peak then peak=heights[x][y] end
+  end
+ end
+ if peak>peak_bottom_smooth then
+  peak_bottom_smooth = peak
+ end
+ if peak_bottom_smooth<=0 then return end
  for s=0,grid_w+grid_h-2 do
   for gx=1,grid_w do
    local gy = s-gx+2
    if gy>=1 and gy<=grid_h then
     local h = heights[gx][gy]
-    if h>0 and is_in_bulb(gx,gy) then
-     local lx,lz = grid_to_local(gx,gy,bulb_inner_r)
-     draw_iso_column(lx,lz,base_y,h,col,dir)
+    if h>0 and max_h[gx][gy]>0 then
+     local lx,lz = grid_to_local(gx,gy,rim_r)
+     local ratio = h/peak_bottom_smooth
+     local c = ratio>0.66 and 9 or (ratio>0.33 and 15 or 4)
+     draw_iso_column(lx,lz,base_y,h,c,dir)
     end
    end
   end
  end
 end
 
--- ===============================
--- sand physics: heightmap toppling + grain stream
--- ===============================
-
--- the bulb is a cone, not a cylinder: columns near the neck can only
--- spread to a smaller radius than columns near the rim. allowed radius
--- tapers from bulb_inner_r at the base to neck_r at the tip
-function is_in_tapered_bulb(gx,gy,col_height,max_height)
- local lx,lz = grid_to_local(gx,gy,bulb_inner_r)
- local dist = sqrt(lx*lx+lz*lz)
- local t = col_height/max_height
- local allowed = bulb_inner_r*(1-t) + neck_r*t
- return dist <= allowed
+function draw_heightmap_top(heights)
+ local peak = 0
+ for x=1,grid_w do
+  for y=1,grid_h do
+   if heights[x][y]>peak then peak=heights[x][y] end
+  end
+ end
+ if peak>peak_top_smooth then
+  peak_top_smooth = peak
+ else
+  peak_top_smooth = max(peak, peak_top_smooth-0.05)
+ end
+ if peak_top_smooth<=0 then return end
+ for s=0,grid_w+grid_h-2 do
+  for gx=1,grid_w do
+   local gy = s-gx+2
+   if gy>=1 and gy<=grid_h then
+    local h = heights[gx][gy]
+    local mh = max_h[gx][gy]
+    if h>0 and mh>0 then
+     local lx,lz = grid_to_local(gx,gy,rim_r)
+     local ratio = h/peak_top_smooth
+     local c = ratio>0.66 and 9 or (ratio>0.33 and 15 or 4)
+     local base_y = top_rim_y - mh
+     draw_iso_column(lx,lz,base_y,h,c,1)
+    end
+   end
+  end
+ end
 end
+-- ===============================
+-- sand physics: heightmap toppling + unified grain grid
+-- ===============================
 
--- if a neighbor column is more than  shorter, move
+-- if a neighbor column is more than repose_threshold shorter, move
 -- 1 unit into it. grav_x,grav_y unused in phase 2 (always upright);
 -- kept so phase 3 can pass the live gravity vector without a signature change
 function topple_pass(heights,grav_x,grav_y)
  for x=1,grid_w do
   for y=1,grid_h do
-   if not is_in_bulb(x,y) then goto continue end
+   if max_h[x][y]==0 then goto continue end
    local h = heights[x][y]
    for dx=-1,1 do
     for dy=-1,1 do
@@ -187,7 +291,7 @@ function topple_pass(heights,grav_x,grav_y)
       local nx,ny = x+dx,y+dy
       if nx>=1 and nx<=grid_w and ny>=1 and ny<=grid_h then
        local nh = heights[nx][ny]
-       if nh<h-repose_threshold and is_in_tapered_bulb(nx,ny,nh+1,bulb_max_h) then
+       if nh<h-repose_threshold and nh+1<=max_h[nx][ny] then
         heights[x][y] -= 1
         heights[nx][ny] += 1
         h -= 1
@@ -201,59 +305,187 @@ function topple_pass(heights,grav_x,grav_y)
  end
 end
 
--- release one grain into the top of the neck every frames_per_grain
--- frames, conserving mass by pulling it from the fixed drain cell
-function spawn_grain()
- grain_timer += 1
-if grain_timer < frames_per_grain then return end
-grain_timer = 0
- if neck_grid[2][1] then return end
- -- find tallest cell near center
- local bx,by,bh = 0,0,0
+-- sums heights_top + heights_bottom + in-flight grains; should stay == grains_total.
+-- cheap, non-visual sanity check -- call from the pico-8 console when debugging,
+-- not wired into the game loop
+function count_total_mass()
+ local total = 0
  for x=1,grid_w do
   for y=1,grid_h do
-   if is_in_bulb(x,y) and heights_top[x][y]>bh then
-    bx,by,bh = x,y,heights_top[x][y]
+   total += heights_top[x][y] + heights_bottom[x][y]
+  end
+ end
+ for r=1,grain_rows do
+  for c=1,grain_cols(r) do
+   if grain_grid[r][c] then
+    total += 1
    end
   end
  end
- if bh>0 then
-  neck_grid[2][1] = true
-  heights_top[bx][by] -= 1
+ return total
+end
+
+-- number of columns in the grain grid at this row: narrow (neck) for
+-- rows 1..grain_neck_rows, then linearly widens to grain_wide_cols
+function grain_cols(row)
+ if row <= grain_neck_rows then
+  return grain_narrow_cols
+ else
+  local t = (row-grain_neck_rows) / (grain_rows-grain_neck_rows)
+  return flr(grain_narrow_cols + (grain_wide_cols-grain_narrow_cols)*t + 0.5)
  end
 end
 
--- steps every grain one row through the neck. scan order is bottom-row
--- upward (prevents a grain tunneling two rows in one frame) with the
--- column scan direction alternated each frame to avoid an l/r bias
-function update_grains()
- local cols = scan_lr and {1,2,3} or {3,2,1}
- for row=neck_rows,1,-1 do
-  for ci=1,#cols do local col=cols[ci]
-   if neck_grid[col][row] then
-    if row==neck_rows then
-     neck_grid[col][row] = false
-     local ex,ey = neck_gx+(col-2),neck_gy
-     if is_in_tapered_bulb(ex,ey,heights_bottom[ex][ey]+1,bulb_max_h) then
-      heights_bottom[ex][ey] += 1
+function init_grain_grid()
+ for r=1,grain_rows do
+  grain_grid[r] = {}
+  for c=1,grain_cols(r) do
+   grain_grid[r][c] = false
+  end
+ end
+end
+
+-- maps a grain's (col,row) position in the tapered grid back to a
+-- heightmap grid cell, using the same fixed center (neck_gx,neck_gy)
+-- as everything else that talks to the heightmap
+ function grain_to_heightmap(col, row)
+ local cols = grain_cols(row)
+ local cx = (cols+1)/2
+ local hx = flr(neck_gx + (col-cx) + (rnd(2)-1) + 0.5)
+ local hy = flr(neck_gy + (rnd(5)-2.5) + 0.5)
+ return hx, hy
+end
+
+-- release one grain into the top of the neck every frames_per_grain
+-- frames, conserving mass by pulling it from one of the tallest heights_top
+-- cells (chosen at random among ties) and dropping it into a random open
+-- entry column, so repeated draws don't settle into one preferred lane
+function spawn_grain()
+ grain_timer += 1
+ while grain_timer >= frames_per_grain do
+  grain_timer -= frames_per_grain
+
+  local entry_cols = grain_cols(1)
+  local open_cols = {}
+  for c=1,entry_cols do
+   if not grain_grid[1][c] then
+    add(open_cols,c)
+   end
+  end
+  if #open_cols==0 then break end
+  local entry_col = open_cols[flr(rnd(#open_cols))+1]
+
+  local best = -32000
+  for x=1,grid_w do
+   for y=1,grid_h do
+    if max_h[x][y]>0 and heights_top[x][y]>0 then
+     local surface = (top_rim_y - max_h[x][y]) + heights_top[x][y]
+     if surface>best then best=surface end
+    end
+   end
+  end
+  if best<=-32000 then break end
+
+  local candidates = {}
+  for x=1,grid_w do
+   for y=1,grid_h do
+    if max_h[x][y]>0 and heights_top[x][y]>0 then
+     local surface = (top_rim_y - max_h[x][y]) + heights_top[x][y]
+     if surface==best then add(candidates,{x,y}) end
+    end
+   end
+  end
+  local pick = candidates[flr(rnd(#candidates))+1]
+  grain_grid[1][entry_col] = true
+  heights_top[pick[1]][pick[2]] -= 1
+ end
+end
+
+-- steps every grain one row through the tapered grid. scan order is
+-- bottom-row upward (prevents a grain tunneling two rows in one frame),
+-- with the column scan direction alternated each frame and the sideways-
+-- search tie-break ({-d,d} vs {d,-d}) randomized per attempt -- both are
+-- needed to avoid a persistent l/r bias; scan direction alone isn't enough
+-- since a fixed tie-break still favors one side on every contested cell.
+-- grav_x,grav_y unused in phase 2 (always upright); phase 3 will
+-- parameterize "down"/"diagonal" by the live gravity vector instead of row+1
+function update_grain_grid(grav_x,grav_y)
+ for row=grain_rows,1,-1 do
+  local cols = grain_cols(row)
+  local col_start = scan_lr and 1 or cols
+  local col_end = scan_lr and cols or 1
+  local col_step = scan_lr and 1 or -1
+  for col=col_start,col_end,col_step do
+   if grain_grid[row][col] then
+    if row==grain_rows then
+     local hx,hy = grain_to_heightmap(col,row)
+     if max_h[hx][hy]>0 and heights_bottom[hx][hy]<max_h[hx][hy] then
+      grain_grid[row][col] = false
+      heights_bottom[hx][hy] += 1
+     else
+      for d=1,cols-1 do
+       local placed = false
+       local dcs = (rnd(1)<0.5) and {-d,d} or {d,-d}
+       for _,dc in pairs(dcs) do
+        local nc2 = col+dc
+        if nc2>=1 and nc2<=cols and not grain_grid[row][nc2] then
+         local hx2,hy2 = grain_to_heightmap(nc2,row)
+         if max_h[hx2][hy2]>0 and heights_bottom[hx2][hy2]<max_h[hx2][hy2] then
+          grain_grid[row][col] = false
+          grain_grid[row][nc2] = true
+          placed = true
+          break
+         end
+        end
+       end
+       if placed then break end
+      end
      end
     else
-     local below_ok = not neck_grid[col][row+1]
-     local dl_ok = col>1 and not neck_grid[col-1][row+1]
-     local dr_ok = col<neck_cols and not neck_grid[col+1][row+1]
+     local next_cols = grain_cols(row+1)
+     local t = (col-0.5)/cols
+     local jitter = rnd(1) - 0.5
+     local next_cols = grain_cols(row+1)
+local t = (col-0.5)/cols
+local jitter = rnd(1) - 0.5
+local mapped_col = mid(1,flr(t*next_cols+jitter)+1,next_cols)
+
      local nc,nr = col,row
-     if below_ok then
-      nr = row+1
-     elseif dl_ok and dr_ok then
-      nc,nr = (rnd(1)<0.5) and col-1 or col+1,row+1
-     elseif dl_ok then
-      nc,nr = col-1,row+1
-     elseif dr_ok then
-      nc,nr = col+1,row+1
+     if not grain_grid[row+1][mapped_col] then
+      nc,nr = mapped_col,row+1
+     else
+      for d=1,next_cols-1 do
+       local placed = false
+       local dcs = (rnd(1)<0.5) and {-d,d} or {d,-d}
+       for _,dc in pairs(dcs) do
+        local nc2 = mapped_col+dc
+        if nc2>=1 and nc2<=next_cols and not grain_grid[row+1][nc2] then
+         nc,nr = nc2,row+1
+         placed = true
+         break
+        end
+       end
+       if placed then break end
+      end
      end
      if nr~=row then
-      neck_grid[col][row] = false
-      neck_grid[nc][nr] = true
+      grain_grid[row][col] = false
+      grain_grid[nr][nc] = true
+     else
+      for d=1,cols-1 do
+       local placed = false
+       local dcs = (rnd(1)<0.5) and {-d,d} or {d,-d}
+       for _,dc in pairs(dcs) do
+        local sc = col+dc
+        if sc>=1 and sc<=cols and not grain_grid[row][sc] then
+         grain_grid[row][col] = false
+         grain_grid[row][sc] = true
+         placed = true
+         break
+        end
+       end
+       if placed then break end
+      end
      end
     end
    end
@@ -262,17 +494,49 @@ function update_grains()
  scan_lr = not scan_lr
 end
 
-function draw_grains()
- for c=1,neck_cols do
-  for r=1,neck_rows do
-   if neck_grid[c][r] then
-    local lx = (c-2)*1.5
-    local ly = neck_top_y-(r-1)*neck_row_step
-    local sx,sy = iso_project(lx,ly,0)
-    line(sx,sy,sx,sy+1,9)
+-- during rotation the grain grid may need to be emptied into the
+-- heightmap before top/bottom swap; not called yet in phase 2
+function flush_grains_to_heightmap()
+ for r=1,grain_rows do
+  for c=1,grain_cols(r) do
+   if grain_grid[r][c] then
+    local hx,hy = grain_to_heightmap(c,r)
+    if max_h[hx][hy]>0 and heights_bottom[hx][hy]<max_h[hx][hy] then
+     grain_grid[r][c] = false
+     heights_bottom[hx][hy] += 1
+    end
    end
   end
  end
+end
+
+function draw_grain_grid()
+ for r=1,grain_rows do
+  local cols = grain_cols(r)
+  local cx = (cols+1)/2
+  for c=1,cols do
+   if grain_grid[r][c] then
+    local lx = (c-cx)*1.5
+    local ly = grain_top_y-(r-1)*grain_row_step
+    local sx,sy = iso_project(lx,ly,0)
+    pset(sx,sy,9)
+   end
+  end
+ end
+end
+
+-- ===============================
+-- phase 3 prep (not called yet)
+-- ===============================
+
+function rotate_x(y,z,theta_turns)
+ local ny = y*cos(theta_turns) - z*sin(theta_turns)
+ local nz = y*sin(theta_turns) + z*cos(theta_turns)
+ return ny,nz
+end
+
+function get_gravity_vector(angle_turns)
+ return sin(angle_turns), cos(angle_turns)
 end
 
 -- ===============================
@@ -282,25 +546,58 @@ end
 function _update()
  frame_count += 1
  topple_pass(heights_top,0,1)
- for i=1,3 do
-  topple_pass(heights_bottom,0,1)
+ for i=1,4 do
+  topple_pass(heights_bottom,0,9)
  end
  spawn_grain()
- update_grains()
+ for i=1,1 do
+  update_grain_grid(0,9)
+ end
 end
 
 function _draw()
  cls(0)
- draw_heightmap(heights_bottom,bot_rim_y,9,1,bulb_max_h)   -- rests on the bulb floor, piles upward
- draw_heightmap(heights_top,top_rim_y,9,-1,bulb_max_h)    -- hangs from the rim, fills downward toward the neck
- draw_grains()
- draw_hourglass()
+ draw_hourglass_back()
+ draw_heightmap(heights_bottom,bot_rim_y,1)
+ draw_heightmap_top(heights_top)
+ draw_grain_grid()
+ draw_hourglass_front()
+
+ if debug_mode then
+  draw_debug_overlay()
+ end
+end
+
+-- mass/grain debug overlay: top_sum+bot_sum should track count_total_mass(),
+-- and the stuck grain finder flags a grain that hasn't advanced this frame
+function draw_debug_overlay()
+ local top_sum,bot_sum = 0,0
+ for x=1,grid_w do
+  for y=1,grid_h do
+   top_sum += heights_top[x][y]
+   bot_sum += heights_bottom[x][y]
+  end
+ end
+ print("top:"..top_sum,2,2,7)
+ print("bot:"..bot_sum,2,8,7)
+
+ local stuck_r,stuck_c = -1,-1
+ for r=1,grain_rows do
+  for c=1,grain_cols(r) do
+   if grain_grid[r][c] then
+    stuck_r,stuck_c = r,c
+    break
+   end
+  end
+  if stuck_r>-1 then break end
+ end
+ print("grain@ r"..stuck_r.." c"..stuck_c,2,14,7)
 end
 
 __gfx__
 00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-00700700000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000550009900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00700700050000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 00077000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 00077000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 00700700000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
@@ -436,9 +733,9 @@ __map__
 0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000010100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000001010100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000010100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
